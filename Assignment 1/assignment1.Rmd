@@ -1,0 +1,184 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+---
+title: "Assignment 1"
+output: html_document
+author: Nithilan Manimaran
+date: "2023-02-14"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r Loading libraries, echo=FALSE, message=FALSE, results='hide'}
+
+if (!requireNamespace("BiocManager", quietly = TRUE)){
+  install.packages("BiocManager")}
+if (!requireNamespace("GEOmetadb", quietly = TRUE)){
+  BiocManager::install("GEOmetadb")}
+if (!requireNamespace("GEOmetadb", quietly = TRUE)){
+  install.packages("knitr")}
+if (!requireNamespace("edgeR", quietly = TRUE)){
+  BiocManager::install("edgeR")}
+if (!requireNamespace("biomaRt", quietly = TRUE)){
+  BiocManager::install("biomaRt")}
+if (!requireNamespace("DBI", quietly = TRUE)){
+  install.packages("DBI")}
+if (!requireNamespace("GEOquery", quietly = TRUE)){
+  BiocManager::install("GEOquery")}
+```
+## Part 1: Selecting an Expression Dataset
+Using GEOmetadb to query datasets of interest and selecting relavent ones (dont evaluate on knit)
+```{r eval=FALSE}
+if(!file.exists('GEOmetadb.sqlite')) 
+  GEOmetadb::getSQLiteFile()
+con <- DBI::dbConnect(RSQLite::SQLite(),'GEOmetadb.sqlite', 
+                      synchronous = NULL)
+Geo_tables <- DBI::dbListTables(con)
+Geo_tables
+```
+Query datasets with high throughput seqeuncing and RNA-Seq in title. I also browsed through the GEO interactive search to find the dataset.
+```{r eval=FALSE}
+sql <- paste("SELECT DISTINCT gse.title,gse.gse, gpl.title,",
+" gse.submission_date,",
+" gse.supplementary_file",
+"FROM",
+" gse JOIN gse_gpl ON gse_gpl.gse=gse.gse",
+" JOIN gpl ON gse_gpl.gpl=gpl.gpl",
+"WHERE",
+" gse.title LIKE '%RNA-Seq%' AND",
+" gpl.organism LIKE '%Homo sapiens%' AND",
+" gpl.technology LIKE '%High-throughput sequencing%' ",sep=" ")
+result <- DBI::dbGetQuery(con,sql)
+```
+## Part 2: Data cleaning (Chosen Dataset - GSE148372)
+Now that the dataset of interest is chosen, retrieve the metadata and supplementary files of interest.
+```{r message=FALSE}
+chosen_gse <- invisible(GEOquery::getGEO("GSE148372", GSEMatrix = FALSE))
+chosen_gse_info <- data.frame(head(GEOquery::Meta(chosen_gse)))
+
+chosen_geo <- names(GEOquery::GPLList(chosen_gse))[1]
+chosen_geo <- GEOquery::Meta(GEOquery::getGEO(chosen_geo))
+chosen_geo$title
+chosen_geo$submission_date
+chosen_geo$last_update_date
+chosen_geo$organism
+length(chosen_geo$series_id)
+length(chosen_geo$sample_id)
+```
+### Platform information on chosen dataset:
+**Title** : `r chosen_geo$title` \
+**Submission data** : `r chosen_geo$submission_date` \
+**Last update data** : `r chosen_geo$last_update_date` \ 
+**Organism** : `r chosen_geo$organism` \
+**Number of GEO datasets that use this technology** : `r length(chosen_geo$series_id)` \
+**Number of GEO samples that use this technology** : `r length(chosen_geo$sample_id)` 
+**Contact Location** : `r chosen_geo$contact_country` \
+
+The dataset only has one supplementary file with counts, this code simply looks into some initial info and stores the csv dataframe in memory.
+```{r}
+if (!exists('sfiles'))
+  sfiles <- GEOquery::getGEOSuppFiles('GSE148372', filter_regex = "csv")
+fnames <- rownames(sfiles)
+fnames
+RNAfile <- read.csv(fnames[1], check.names = FALSE)
+colnames(RNAfile)[1] <- "gene" 
+RNAfile
+colnames(RNAfile)
+dim(RNAfile)
+```
+## Part 3: Mapping to HUGO symbols
+
+This section will look into generating the HGNC symbol mapping for each gene in the data.\
+Since the dataset does not have ensemble ids attached to it, the gene identifier is used to try and match the symbols.
+```{r Gene Identifier Mapping and Filter}
+if(!exists('ensembl')){
+  ensembl <- biomaRt::useMart(biomart = "ensembl", dataset="hsapiens_gene_ensembl")
+}
+  geneID_map <- biomaRt::getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol'),
+                                 filters = 'ensembl_gene_id',
+                                 values = RNAfile$gene,
+                                 mart = ensembl)
+
+dim(geneID_map)
+```
+As seen above, the geneId map does not result in any symbols to match with. Since there is not ensemble id \
+attached to the dataset, the gene identifiers will be used in this report instead of HGNC symbols.
+
+## Part 4: Normalization
+```{r normalize, warning=FALSE} 
+grouping <-lapply(colnames(RNAfile)[2:length(colnames(RNAfile))], function (x) {unlist(strsplit(x, split='\\.'))[1]})
+RNA_matrix <- data.frame(RNAfile, check.names = F)
+colnames(RNA_matrix) <- c('gene', grouping)
+df <- RNA_matrix[, -1]
+colnames(df) <- grouping
+df <- t(rowsum(t(df), group = colnames(df), na.rm = T ))
+colnames(df)
+grouping <- data.frame(unique(grouping))
+colnames(df)
+# create DEGList and calculate normalization factors:
+dge = edgeR::DGEList(counts=data.matrix(df), group=grouping)
+dge = edgeR::calcNormFactors(dge, method = "TMM")
+normalized_counts <- edgeR::cpm(dge)
+normalized_counts <- data.frame(cbind(data.frame(normalized_counts), gene=RNAfile$gene))
+normalized_counts
+```
+### Steps taken to normalize the counts data - 
+1. Define groupings for dataset: 
+  - The sample has been grouped by 4 different types of cell lines: "HCC1806"  "HCC1954"  "JIMT1"  "MDAMB231" as the experiment focuses on these 4 cell lines\
+2. Next, the DEGList object is created and we use the TMM method to normalize the counts: \
+  - The reason for using TMM is to account for the size variation between samples of interest in the library and accounting for the fact that some genes that are extremely differently expressed will skew results.
+3. The normalized counts are then attached along with the gene identifier column to effectively use the data later in analyses.
+
+## Part 5: Visualization
+### MDS plot to see relations between counts of different cell lines in the experiment
+```{r, echo=FALSE}
+library(edgeR)
+dfg <- data.frame(cbind(df, gene=unlist(RNAfile$gene)))
+plotMDS(dge, cex=0.5, main='Fig 1: MDS relation on normalized counts')
+```
+
+It is evident that the HCC1954 and MDAMB231 cell lines are more represented in this dataset while JIMT1 and HCC1806 are more closely represented.
+
+### Gene representation for each cell line
+```{r}
+par(mfrow=c(2,2))
+barplot(normalized_counts$HCC1806, names.arg = normalized_counts$gene, main="HCC1806")
+barplot(normalized_counts$HCC1954, names.arg = normalized_counts$gene, main="HCC1954")
+barplot(normalized_counts$JIMT1, names.arg = normalized_counts$gene, main="JIMT1")
+barplot(normalized_counts$MDAMB231, names.arg = normalized_counts$gene, main="MDAMB231")
+```
+
+## Part 6: Questions
+### What are the control and test conditions of the dataset?
+MDAMB231, HCC1806, HCC1954, and JIMT1 cell lines are controls in the dataset. They are compared with infected CRISPR/Cas9-expressing versions of themselves in the dataset.
+
+### Why is the dataset of interest to you? 
+The study mentions that a large subset of deaths from cancers are attributed to metastasis. Since large scale research in this field is impractivcal the use of human cells in mouse xenografts can allow to scale this.
+
+### Were there expression values that were not unique for specific genes? How did you handle these?
+No, the counts dataset had already one row per gene for every cell line in the experiment.
+
+### Were there expression values that could not be mapped to current HUGO symbols?
+Yes, the dataset did not come with ensemble ids and therefore had to use the gene symbols already present in the dataset for the analysis.
+
+### How many outliers were removed?
+The dataset is not too large and did not have much variation for obvious outliers and therefore none have been removed.
+
+### How did you handle replicates?
+Replicate columns were merged in by summing up count values.
+
+### What is the final coverage of your dataset?
+The final dataset includes 23,686 rows of normalized counts for each of the cell lines.
+
+## References
+- Jin X, Demere Z, Nair K, Ali A et al. A metastasis map of human cancer cell lines. Nature 2020 Dec;588(7837):331-336. PMID: 33299191
+- GEO overview. (n.d.). Nih.gov. Retrieved February 14, 2023, from https://www.ncbi.nlm.nih.gov/geo/info/overview.html
+- Law CW, Alhamdoosh M, Su S, Dong X, Tian L, Smyth GK, Ritchie ME (2018). “RNA-seq analysis is easy as 1-2-3 with limma, Glimma and edgeR.” F1000Research, 5, 1408.
+
